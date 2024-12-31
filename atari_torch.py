@@ -62,6 +62,7 @@ class ConvCfC(nn.Module):
         # Separate time and batch dimension again
         x = x.view(batch_size, seq_len, *x.shape[1:])
         x, hx = self.rnn(x, hx)  # hx is the hidden state of the RNN
+        print("x: ", x.shape, "\n" , "hx: ", hx.shape)
         return x, hx
 
 
@@ -99,6 +100,13 @@ def train_one_epoch(model, criterion, optimizer, trainloader):
         outputs, hx = model(inputs)
         labels = labels.view(-1, *labels.shape[2:])  # flatten
         outputs = outputs.reshape(-1, *outputs.shape[2:])  # flatten
+        print(outputs.shape)
+        print(outputs)
+
+        print("labels shape", labels.shape)
+        print("labels values", labels)
+        print("min and max values respectively of labels", torch.min(labels), " ", torch.max(labels))
+
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
@@ -161,7 +169,7 @@ if __name__ == "__main__":
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.0001)
 
-    for epoch in range(50):  # loop over the dataset multiple times
+    for epoch in range(1):  # loop over the dataset multiple times
         train_one_epoch(model, criterion, optimizer, trainloader)
 
         # Evaluate model on the validation set
