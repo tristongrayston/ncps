@@ -25,7 +25,7 @@ def lecun_tanh(x):
 
 
 @tf.keras.utils.register_keras_serializable(package="ncps", name="CfCCell")
-class CfCCell(tf.keras.layers):
+class CfCCell(tf.keras.layers.Layer):
     def __init__(
         self,
         units,

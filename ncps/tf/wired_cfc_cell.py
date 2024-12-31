@@ -9,7 +9,7 @@ import numpy as np
 
 
 @tf.keras.utils.register_keras_serializable(package="ncps", name="WiredCfCCell")
-class WiredCfCCell(tf.keras.layers.AbstractRNNCell):
+class WiredCfCCell(tf.keras.layers.Layer):
     def __init__(
         self,
         wiring,

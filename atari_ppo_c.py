@@ -13,6 +13,7 @@ import numpy as np
 from ray.rllib.models.modelv2 import ModelV2
 from ray.rllib.models.tf.recurrent_net import RecurrentNetwork
 from ray.rllib.utils.annotations import override
+from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
 
 import tensorflow as tf
 from ncps.tf.cfc import CfC
@@ -138,7 +139,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     register_env("atari_env", lambda env_config: wrap_deepmind(gym.make(args.env)))
-    config = {
+
+    config = AlgorithmConfig().update_from_dict({
         "env": "atari_env",
         "preprocessor_pref": None,
         "gamma": 0.99,
@@ -152,7 +154,7 @@ if __name__ == "__main__":
         "clip_param": 0.1,
         "vf_clip_param": 10.0,
         "entropy_coeff": 0.01,
-        "rollout_fragment_length": 100,
+        "rollout_fragment_length": "auto",
         "sgd_minibatch_size": 500,
         "num_sgd_iter": 10,
         "batch_mode": "truncate_episodes",
@@ -166,7 +168,11 @@ if __name__ == "__main__":
             },
         },
         "framework": "tf2",
-    }
+        "api_stack": {
+            "enable_rl_module_and_learner": False,
+            "enable_env_runner_and_connector_v2": False,
+        },
+    })
 
     algo = PPO(config=config)
 
