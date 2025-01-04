@@ -11,21 +11,24 @@ Todo: Add Entropy
 
 
 class PPO:
-    def __init__(self, 
-                 ob_space, 
-                 actions, 
-                 n_batches, 
-                 gamma, 
-                 lam, 
-                 kl_coeff, 
-                 clip_rewards, 
-                 clip_param, 
-                 vf_clip_param, 
-                 entropy_coeff,
-                 a_lr,
-                 c_lr,
-                 device,
-                 **kwargs):
+    def __init__(
+        self,
+        ob_space,
+        actions,
+        n_batches=10,            # default number of batches
+        gamma=0.99,              # discount factor
+        lam=0.95,                # GAE (Generalized Advantage Estimation) lambda
+        kl_coeff=0.2,            # coefficient for KL penalty (if used)
+        clip_rewards=False,      # whether to clip rewards
+        clip_param=0.2,          # PPO clipping parameter
+        vf_clip_param=10.0,      # value function clipping parameter
+        entropy_coeff=0.01,      # entropy bonus coefficient
+        a_lr=3e-4,               # actor learning rate
+        c_lr=3e-4,               # critic learning rate
+        device='cpu',            # device, e.g. 'cpu' or 'cuda'
+        max_ts=1_000_000,        # max timesteps
+        **kwargs
+        ):
         """
         Proximal Policy Optimization (PPO) initialization.
         
@@ -71,6 +74,7 @@ class PPO:
         self.entropy_coeff = entropy_coeff
         self.a_lr = a_lr
         self.c_lr = c_lr
+        self.max_ts = max_ts
         self.device = device
 
         # Optionally store any extra keyword arguments
@@ -109,7 +113,18 @@ class PPO:
         self.cov_var = t.full(size=(self.act_dim,), fill_value=0.5)
         self.cov_mat = t.diag(self.cov_var)
 
-    def get_action(self, obs):
+        # Logger, credit: Eric Yang Yu
+        # This logger will help us with printing out summaries of each iteration
+        self.logger = {
+            'delta_t': time.time_ns(),
+            't_so_far': 0,          # timesteps so far
+            'i_so_far': 0,          # iterations so far
+            'batch_lens': [],       # episodic lengths in batch
+            'batch_rews': [],       # episodic returns in batch
+            'actor_losses': [],     # losses of actor network in current iteration
+        }
+
+    def get_action(self, obs, rollout=True):
         """
             Queries an action from the actor network, should be called from rollout.
 
@@ -133,14 +148,45 @@ class PPO:
 
         return action.detach().numpy(), log_prob.detach()
     
-    def get_vf(self, obs):
+    def get_vf(self, obs, rollout=True):
         with t.no_grad():
             feats = self.backbone(obs)
             vf = self.critic(feats)
 
         return vf.detach().numpy()
     
-    def calculate_gaes(self, rewards, values, gamma=0.99, decay=0.97):
+    def evaluate(self, batch_obs, batch_acts):
+        """
+            Estimate the values of each observation, and the log probs of
+            each action in the most recent batch with the most recent
+            iteration of the actor network. Should be called from learn.
+
+            Parameters:
+                batch_obs - the observations from the most recently collected batch as a tensor.
+                            Shape: (number of timesteps in batch, dimension of observation)
+                batch_acts - the actions from the most recently collected batch as a tensor.
+                            Shape: (number of timesteps in batch, dimension of action)
+
+            Return:
+                V - the predicted values of batch_obs
+                log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
+        """
+        feats = self.backbone(batch_obs)
+
+        # Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
+        V = self.critic(feats).squeeze()
+
+        # Calculate the log probabilities of batch actions using most recent actor network.
+        # This segment of code is similar to that in get_action()
+        mean = self.actor(feats)
+        dist = t.distributions.MultivariateNormal(mean, self.cov_mat)
+        log_probs = dist.log_prob(batch_acts)
+
+        # Return the value vector V of each observation in the batch
+        # and log probabilities log_probs of each action in the batch
+        return V, log_probs
+    
+    def calculate_gaes(self, rewards, values):
         """
         Return the General Advantage Estimates from the given rewards and values.
         Paper: https://arxiv.org/pdf/1506.02438.pdf
@@ -150,44 +196,182 @@ class PPO:
         values = t.stack(values).detach().cpu().numpy()
 
         next_values = np.concatenate([values[1:], [[0]]])
-        deltas = [rew + gamma * next_val - val for rew, val, next_val in zip(rewards, values, next_values)]
+        deltas = [rew + self.gamma * next_val - val for rew, val, next_val in zip(rewards, values, next_values)]
 
         gaes = [deltas[-1]]
         for i in reversed(range(len(deltas)-1)):
-            gaes.append(deltas[i] + decay * gamma * gaes[-1])
+            gaes.append(deltas[i] + self.lam * self.gamma * gaes[-1])
 
         return np.array(gaes[::-1])
+    
+    def discount_rewards(self, rewards):
+        """
+        Return discounted rewards based on the given rewards and gamma param.
+
+        Credit: Eden Meyer
+        """
+        new_rewards = [float(rewards[-1])]
+        for i in reversed(range(len(rewards)-1)):
+            new_rewards.append(float(rewards[i]) + self.gamma * new_rewards[-1])
+        return t.tensor(new_rewards[::-1], dtype=t.float32, device=self.device)
 
 
     def rollout(self, env, max_steps):
         """
         Takes the environment and performs one episode of the environment. 
         """
-        train_data = [[], [], [], [], [], []] # obs, action, rewards, values, act_log_probs, dones
+        obs = []
+        actions = []
+        advantages = []
+        returns = []
+        act_log_probs = []
+        dones = []
+
         obs, _ = env.reset()
 
         ep_reward = 0.0
+        for i in range(self.max_ts):
+            # We want to make sure we train on atleast this many number of timesteps per episode
+            rollout_reward = []
+            rollout_values = []
+            
+            # Perform Rollout 
+            for _ in range(max_steps):
+                # Action
+                vect_obs = t.tensor(obs, dtype=t.float32, device=self.device)
 
-        # Perform Rollout 
-        for _ in range(max_steps):
-            # Action
-            vect_obs = t.tensor(obs, dtype=t.float32, device=self.device)
+                action, log_prob = self.get_action(vect_obs)
+                vals = self.get_vf(vect_obs)
 
-            action, log_prob = self.get_action(vect_obs)
-            vals = self.get_vf(vect_obs)
+                next_obs, reward, done, trun, _ = env.step(action.item())
+                for dest_list, new_value in zip(
+                    (obs, actions, rollout_reward, rollout_values, act_log_probs, dones),
+                    (vect_obs, action, reward, vals, log_prob, done)):
 
-            next_obs, reward, done, trun, _ = env.step(action.item())
-            for i, item in enumerate((obs, action, reward, vals, log_prob, done)):
-                train_data[i].append(item)
+                    dest_list.append(new_value)
+                    rollout_values.append(vals)
 
-            obs = next_obs
-            ep_reward += reward 
-            if done:
-                break
+                obs = next_obs
+                ep_reward += reward 
+                if done:
+                    break
         
-        # --- Get GAE, replacing values with advantages. --- 
+            # Get GAE, replacing values with advantages.
         
-        train_data[3] = self.calculate_gaes(train_data[2], train_data[3])
-        return train_data, ep_reward
+            rollout_adv = self.calculate_gaes(reward, rollout_values)
+            advantages.append(rollout_adv)
+
+            # Get returns
+
+            ep_returns = self.discount_rewards(rollout_reward)
+            returns.append(ep_returns)
+
+        return obs, actions, advantages, returns, act_log_probs, dones, ep_reward
+
+    def learn(self, total_timesteps, env):
+        """
+            Train the actor and critic networks. Here is where the main PPO algorithm resides.
+
+            Parameters:
+                total_timesteps - the total number of timesteps to train for
+
+            Return:
+                None
+        """
+        print(f"Learning... Running {self.max_timesteps_per_episode} timesteps per episode, ", end='')
+        print(f"{self.timesteps_per_batch} timesteps per batch for a total of {total_timesteps} timesteps")
+        t_so_far = 0 # Timesteps simulated so far
+        i_so_far = 0 # Iterations ran so far
+        while t_so_far < total_timesteps:                                                                       # ALG STEP 2
+            # Autobots, roll out (just kidding, we're collecting our batch simulations here)
+            obs, actions, advantages, returns, act_log_probs, dones, ep_reward = self.rollout(env, 5000)                     # ALG STEP 3
+
+            # Calculate how many timesteps we collected this batch
+            t_so_far += np.sum(dones)
+
+            # Increment the number of iterations
+            i_so_far += 1
+
+            # Logging timesteps so far and iterations so far
+            self.logger['t_so_far'] = t_so_far
+            self.logger['i_so_far'] = i_so_far
+
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-10)
+
+            # This is the loop where we update our network for some n epochs
+            for _ in range(self.n_updates_per_iteration):                                                       # ALG STEP 6 & 7
+                # Calculate V_phi and pi_theta(a_t | s_t)
+                V, curr_log_probs = self.evaluate(obs, actions)
+
+                ratios = t.exp(curr_log_probs - act_log_probs)
+
+                # Calculate surrogate losses.
+                surr1 = ratios * advantages
+                surr2 = t.clamp(ratios, 1 - self.clip, 1 + self.clip) * advantages
+
+                actor_loss = (-t.min(surr1, surr2)).mean()
+                critic_loss = nn.MSELoss()(V, returns)
+
+                # Calculate gradients and perform backward propagation for actor network
+                self.actor_optim.zero_grad()
+                actor_loss.backward(retain_graph=True)
+                self.actor_optim.step()
+
+                # Calculate gradients and perform backward propagation for critic network
+                self.critic_optim.zero_grad()
+                critic_loss.backward()
+                self.critic_optim.step()
+
+                # Log actor loss
+                self.logger['actor_losses'].append(actor_loss.detach())
+
+            # Print a summary of our training so far
+            self._log_summary()
+
+    def _log_summary(self):
+        """
+            Print to stdout what we've logged so far in the most recent batch.
+
+            Parameters:
+                None
+
+            Return:
+                None
+        """
+        # Calculate logging values. I use a few python shortcuts to calculate each value
+        # without explaining since it's not too important to PPO; feel free to look it over,
+        # and if you have any questions you can email me (look at bottom of README)
+        delta_t = self.logger['delta_t']
+        self.logger['delta_t'] = time.time_ns()
+        delta_t = (self.logger['delta_t'] - delta_t) / 1e9
+        delta_t = str(round(delta_t, 2))
+
+        t_so_far = self.logger['t_so_far']
+        i_so_far = self.logger['i_so_far']
+        avg_ep_lens = np.mean(self.logger['batch_lens'])
+        avg_ep_rews = np.mean([np.sum(ep_rews) for ep_rews in self.logger['batch_rews']])
+        avg_actor_loss = np.mean([losses.float().mean() for losses in self.logger['actor_losses']])
+
+        # Round decimal places for more aesthetic logging messages
+        avg_ep_lens = str(round(avg_ep_lens, 2))
+        avg_ep_rews = str(round(avg_ep_rews, 2))
+        avg_actor_loss = str(round(avg_actor_loss, 5))
+
+        # Print logging statements
+        print(flush=True)
+        print(f"-------------------- Iteration #{i_so_far} --------------------", flush=True)
+        print(f"Average Episodic Length: {avg_ep_lens}", flush=True)
+        print(f"Average Episodic Return: {avg_ep_rews}", flush=True)
+        print(f"Average Loss: {avg_actor_loss}", flush=True)
+        print(f"Timesteps So Far: {t_so_far}", flush=True)
+        print(f"Iteration took: {delta_t} secs", flush=True)
+        print(f"------------------------------------------------------", flush=True)
+        print(flush=True)
+
+        # Reset batch-specific logging data
+        self.logger['batch_lens'] = []
+        self.logger['batch_rews'] = []
+        self.logger['actor_losses'] = []
+
 
 
