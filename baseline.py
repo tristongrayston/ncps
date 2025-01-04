@@ -4,13 +4,13 @@ from ppo import PPO  # Make sure 'ppo.py' is in the same folder or in your Pytho
 
 def train_ppo():
     # 1. Create the environment
-    env = gym.make("CartPole-v1")
+    env = gym.make("Pendulum-v1")
     
     # 2. Instantiate your PPO agent
     #    Pass in any hyperparameters you need. Some are shown here as an example.
     agent = PPO(
-        ob_space=env.observation_space,
-        actions=env.action_space,
+        ob_space=3,
+        actions=1,
         n_batches=10,
         gamma=0.99,
         lam=0.95,
@@ -25,9 +25,9 @@ def train_ppo():
         max_ts=1_000_000,
 
         # Any custom kwargs can also be passed in here. For example:
-        timesteps_per_batch=2048,
+        timesteps_per_batch=3,
         max_timesteps_per_episode=200,
-        n_updates_per_iteration=10,
+        n_updates_per_iteration=3,
     )
     
     # 3. Train the agent
