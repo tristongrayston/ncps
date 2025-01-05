@@ -7,6 +7,10 @@ import os.path as osp
 
 '''
 Todo: Add Entropy
+TODO: Note, for pendulum, the episodes trunicate at 200 time steps and has no failure condition. 
+TODO: Turns out, moving things to gpu doesn't make things quicker if you have a small enough model such that
+the transfer from gpu -> cpu is outpaced by the time it takes for your data to go through your model. 
+Making this quicker, then, is for a time when we can run multiple envs at the same time. until then, cpu it is! 
 '''
 t.autograd.set_detect_anomaly(True)
 
@@ -23,8 +27,8 @@ class PPO:
         clip_param=0.2,          # PPO clipping parameter
         vf_clip_param=10.0,      # value function clipping parameter
         entropy_coeff=0.01,      # entropy bonus coefficient
-        a_lr=3e-4,               # actor learning rate
-        c_lr=3e-4,               # critic learning rate
+        a_lr=1e-5,               # actor learning rate
+        c_lr=1e-5,               # critic learning rate
         device='cpu',            # device, e.g. 'cpu' or 'cuda'
         max_ts=1_000_000,        # max timesteps
         **kwargs
@@ -87,14 +91,12 @@ class PPO:
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
         ).to(self.device)
-
+        
         # Actor
         self.actor = nn.Sequential(
             nn.Linear(64, actions),
-            nn.Softmax()
+            nn.Tanh()
         ).to(self.device)
 
         # Critic
@@ -102,16 +104,21 @@ class PPO:
             nn.Linear(64, 1)
         ).to(self.device)
 
+        # init orth. weights
+        self.backbone.apply(self.init_weights)
+        self.actor.apply(self.init_weights)
+        self.critic.apply(self.init_weights)
+
         # Get Parameters 
         actor_params = list(self.backbone.parameters()) + list(self.actor.parameters())
         critic_params = list(self.backbone.parameters()) + list(self.critic.parameters())
 
         # Optimizers
-        self.actor_optim = optim.Adam(actor_params, lr=a_lr)
-        self.critic_optim = optim.Adam(critic_params, lr=c_lr)
+        self.actor_optim = optim.Adam(actor_params, lr=a_lr, eps=1e-5)
+        self.critic_optim = optim.Adam(critic_params, lr=c_lr, eps=1e-5)
 
-        self.cov_var = t.full(size=(self.actions,), fill_value=0.5)
-        self.cov_mat = t.diag(self.cov_var)
+        self.cov_var = t.full(size=(self.actions,), fill_value=0.5).to(self.device)
+        self.cov_mat = t.diag(self.cov_var).to(self.device)
 
         # Logger, credit: Eric Yang Yu
         # This logger will help us with printing out summaries of each iteration
@@ -123,6 +130,11 @@ class PPO:
             'batch_rews': [],       # episodic returns in batch
             'actor_losses': [],     # losses of actor network in current iteration
         }
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            t.nn.init.xavier_uniform_(m.weight)
+            m.bias.data.fill_(0.01)
 
     def get_action(self, obs, rollout=True):
         """
@@ -138,7 +150,7 @@ class PPO:
         # This might be wrong, check on this later
         with t.no_grad():
             feats = self.backbone(obs)
-            mean = self.actor(feats)
+            mean = self.actor(feats)*2
 
         dist = t.distributions.MultivariateNormal(mean, self.cov_mat)
 
@@ -146,14 +158,14 @@ class PPO:
 
         log_prob = dist.log_prob(action)
 
-        return action.numpy(), log_prob
+        return action.cpu().numpy(), log_prob
     
     def get_vf(self, obs, rollout=True):
         with t.no_grad():
             feats = self.backbone(obs)
             vf = self.critic(feats)
 
-        return vf.numpy()
+        return vf.cpu().numpy()
     
     def evaluate(self, batch_obs, batch_acts):
         """
@@ -178,13 +190,14 @@ class PPO:
 
         # Calculate the log probabilities of batch actions using most recent actor network.
         # This segment of code is similar to that in get_action()
-        mean = self.actor(feats)
+        mean = self.actor(feats)*2
         dist = t.distributions.MultivariateNormal(mean, self.cov_mat)
         log_probs = dist.log_prob(batch_acts)
+        entropy = dist.entropy().mean()
 
         # Return the value vector V of each observation in the batch
         # and log probabilities log_probs of each action in the batch
-        return V, log_probs
+        return V, log_probs, entropy
     
     def calculate_gaes(self, rewards, values):
         """
@@ -216,7 +229,7 @@ class PPO:
         return t.tensor(new_rewards[::-1], dtype=t.float32, device=self.device)
 
 
-    def rollout(self, env, max_steps):
+    def rollout(self, env):
         """
         Takes the environment and performs one episode of the environment. 
         """
@@ -249,7 +262,10 @@ class PPO:
 
                 #print("action", action, " item now ", action.item())
 
-                next_obs, reward, done, trun, _ = env.step(action)
+                next_obs, reward, term, trun, _ = env.step(action)
+
+                done = term | trun 
+
                 for dest_list, new_value in zip(
                     (b_obs, actions, rollout_reward, rollout_values, act_log_probs, dones),
                     (vect_obs, action, reward, vals, log_prob, done)):
@@ -257,6 +273,7 @@ class PPO:
                     #print("dest list$$$$: ", dest_list, "and now type ", type(dest_list))
                     dest_list.append(new_value)
                     rollout_values.append(vals)
+                    dones.append(done)
 
                 obs = next_obs
                 ep_reward += reward 
@@ -284,19 +301,20 @@ class PPO:
         advantages = t.tensor(advantages, device=self.device, dtype=t.float32)
         advantages = advantages.view(-1, 1)
 
-        act_log_probs = np.stack(act_log_probs, axis=0)  
-        act_log_probs = t.tensor(act_log_probs, device=self.device, dtype=t.float32)
+        #act_log_probs = np.stack(act_log_probs, axis=0)  
+        act_log_probs = t.stack(act_log_probs, dim=0)
 
         returns = t.stack(returns, dim=0)
         returns = returns.view(-1, 1)
 
         act_log_probs = act_log_probs.view(-1, 1)
         
-        print("b_obs shape:", b_obs.shape)
-        print("actions shape:", actions.shape)
-        print("advantages shape:", advantages.shape)
-        print("returns shape:", returns.shape)
-        print("act_log_probs shape:", act_log_probs.shape)
+        #print("b_obs shape:", b_obs.shape)
+        #print("actions shape:", actions.shape)
+        #print("advantages shape:", advantages.shape)
+        #print("returns shape:", returns.shape)
+        #print("act_log_probs shape:", act_log_probs.shape)
+        #print("dones shape : ", sum(dones))
 
 
         return b_obs, actions, advantages, returns, act_log_probs, ep_rewards
@@ -315,15 +333,12 @@ class PPO:
         print(f"{self.timesteps_per_batch} timesteps per batch for a total of {total_timesteps} timesteps")
         t_so_far = 0 # Timesteps simulated so far
         i_so_far = 0 # Iterations ran so far
-        while t_so_far < total_timesteps:                                                                       # ALG STEP 2
+        while t_so_far < total_timesteps:                                                                      
             # Autobots, roll out (just kidding, we're collecting our batch simulations here)
-            obs, actions, advantages, returns, act_log_probs, ep_reward = self.rollout(env, 5000) 
-            
-            # Advantages should be a list of lists. 
-            # Stack them into a single NumPy array
+            obs, actions, advantages, returns, act_log_probs, ep_reward = self.rollout(env) 
             
             # Calculate how many timesteps we collected this batch
-            t_so_far += np.sum(400)
+            t_so_far += obs.shape[0]
 
             # Increment the number of iterations
             i_so_far += 1
@@ -335,35 +350,94 @@ class PPO:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-10)
 
             # This is the loop where we update our network for some n epochs
-            for _ in range(self.n_updates_per_iteration):                                                       # ALG STEP 6 & 7
-                # Calculate V_phi and pi_theta(a_t | s_t)
-                V, curr_log_probs = self.evaluate(obs, actions)
+            for _ in range(self.n_updates_per_iteration):
+                for mb_obs, mb_actions, mb_advantages, mb_returns, mb_act_log_probs in \
+                    self.create_minibatches(obs, actions, advantages, returns, act_log_probs, batch_size=500):                                                   
+                    # Calculate V_phi and pi_theta(a_t | s_t)
+                    V, curr_log_probs, entropy = self.evaluate(mb_obs, mb_actions)
 
-                V = V.view(-1, 1)
-                curr_log_probs = curr_log_probs.view(-1, 1)
+                    V = V.view(-1, 1)
+                    curr_log_probs = curr_log_probs.view(-1, 1)
 
-                ratios = t.exp(curr_log_probs - act_log_probs)
+                    ratios = t.exp(curr_log_probs - mb_act_log_probs)
 
-                # Calculate surrogate losses.
-                surr1 = ratios * advantages
-                surr2 = t.clamp(ratios, 1 - self.clip, 1 + self.clip) * advantages
+                    # Calculate surrogate losses.
+                    surr1 = ratios * mb_advantages
+                    surr2 = t.clamp(ratios, 1 - self.clip, 1 + self.clip) * mb_advantages
 
-                actor_loss = (-t.min(surr1, surr2)).mean()
-                critic_loss = nn.MSELoss()(V, returns)
+                    actor_loss = -(t.min(surr1, surr2)).mean() - self.entropy_coeff * entropy
+                    critic_loss = nn.MSELoss()(V, mb_returns)
 
-                # Calculate gradients and perform backward propagation for both network
-                self.actor_optim.zero_grad()
-                self.critic_optim.zero_grad()
-                actor_loss.backward(retain_graph=True)
-                critic_loss.backward()
-                self.actor_optim.step()
-                self.critic_optim.step()
+                    # Calculate gradients and perform backward propagation for both network
+                    self.actor_optim.zero_grad()
+                    self.critic_optim.zero_grad()
+                    actor_loss.backward(retain_graph=True)
+                    critic_loss.backward()
+                    self.actor_optim.step()
+                    self.critic_optim.step()
 
-                # Log actor loss
-                self.logger['actor_losses'].append(actor_loss.detach())
+                    # Log actor loss
+                    #print("actor loss: ", actor_loss.detach().item())
+
+                self.logger['actor_losses'].append(actor_loss.cpu().detach())
 
             # Print a summary of our training so far
             self._log_summary(ep_reward, obs.shape[0])
+
+    def create_minibatches(self, obs, actions, advantages, returns, act_log_probs,
+                        batch_size=64, shuffle=True):
+        """
+        Create minibatches from rollout data for PPO or similar RL algorithms.
+        
+        Parameters
+        ----------
+        obs : np.ndarray
+            Observations from the rollout.
+        actions : np.ndarray
+            Actions taken during the rollout.
+        advantages : np.ndarray
+            Computed advantages for each step in the rollout.
+        returns : np.ndarray
+            Computed returns (discounted sum of rewards) for each step.
+        act_log_probs : np.ndarray
+            Log probabilities of the actions that were taken.
+        ep_rewards : np.ndarray
+            Reward values (either per step or per episode, depending on your storage).
+        batch_size : int
+            Size of each minibatch.
+        shuffle : bool
+            Whether to shuffle (randomize) the data before splitting into minibatches.
+        
+        Yields
+        ------
+        Tuple of np.ndarray
+            The next minibatch (obs, actions, advantages, returns, act_log_probs, ep_rewards).
+        """
+        
+        # Number of samples (timesteps) in the rollout
+        n_samples = len(obs)
+        
+        # Optionally shuffle the data (consistent across all arrays)
+        if shuffle:
+            indices = np.random.permutation(n_samples)
+            obs = obs[indices]
+            actions = actions[indices]
+            advantages = advantages[indices]
+            returns = returns[indices]
+            act_log_probs = act_log_probs[indices]
+        
+        # Generate minibatches
+        for start_idx in range(0, n_samples, batch_size):
+            end_idx = min(start_idx + batch_size, n_samples)
+
+            yield (
+                obs[start_idx:end_idx],
+                actions[start_idx:end_idx],
+                advantages[start_idx:end_idx],
+                returns[start_idx:end_idx],
+                act_log_probs[start_idx:end_idx],
+            )
+
 
     def _log_summary(self, eps_rewards, no_timesteps):
         """
@@ -391,8 +465,8 @@ class PPO:
 
         # Round decimal places for more aesthetic logging messages
         avg_ep_lens = str(round(avg_ep_lens, 2))
-        avg_ep_rews = sum(eps_rewards)/len(eps_rewards)
-        avg_actor_loss = no_timesteps/self.timesteps_per_batch
+        avg_ep_rews = sum(eps_rewards)/self.timesteps_per_batch
+        #avg_actor_loss = no_timesteps/self.timesteps_per_batch
 
         # Print logging statements
         print(flush=True)
