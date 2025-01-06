@@ -2,15 +2,11 @@ import gym
 import numpy as np
 import torch as t
 from ppo import PPO  # Make sure 'ppo.py' is in the same folder or in your Python path
+import matplotlib.pyplot as plt
 
 device = t.device("cuda" if t.cuda.is_available() else "cpu")
 def train_ppo():
-    # 1. Create the environment
     env = gym.make("Pendulum-v1")
-    
-
-    # 2. Instantiate your PPO agent
-    #    Pass in any hyperparameters you need. Some are shown here as an example.
     agent = PPO(
         ob_space=3,
         actions=1,
@@ -22,10 +18,10 @@ def train_ppo():
         clip_param=0.2,
         vf_clip_param=10.0,
         entropy_coeff=0.01,
-        a_lr=3e-4,
-        c_lr=3e-4,
+        a_lr=1e-4,
+        c_lr=1e-4,
         device='cpu',
-        max_ts=1_000_000,
+        max_ts=500_000,
 
         # Any custom kwargs can also be passed in here. For example:
         timesteps_per_batch=5,
@@ -34,7 +30,7 @@ def train_ppo():
     )
     
     # 3. Train the agent
-    total_timesteps = 50_000  # Decide how long you want to train
+    total_timesteps = 1_000_000  # Decide how long you want to train
     agent.learn(total_timesteps=total_timesteps, env=env)
     
     # 4. (Optional) Close the environment
@@ -62,7 +58,30 @@ def test_ppo(ppo_agent):
     # Once the episode is done, close the environment
     env.close()
 
+def plot_eps_rewards(agent):
+    # Extract the list of episode rewards
+    rewards = agent.logger['eps_rewards']
+
+    # Create a new figure
+    plt.figure(figsize=(8, 6))
+
+    # Plot the rewards
+    plt.plot(rewards, marker='o', linestyle='-', color='b')
+
+    # Add axis labels and a title
+    plt.xlabel("Episode")
+    plt.ylabel("Total Reward")
+    plt.title("Episode Rewards Over Time")
+
+    # (Optional) Add grid lines
+    plt.grid(True)
+
+    # Display the plot
+    plt.show()
+
+
 
 if __name__ == "__main__":
     agent = train_ppo()
     test_ppo(agent)
+    plot_eps_rewards(agent)

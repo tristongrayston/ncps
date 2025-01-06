@@ -6,8 +6,7 @@ import time
 import os.path as osp
 
 '''
-Todo: Add Entropy
-TODO: Note, for pendulum, the episodes trunicate at 200 time steps and has no failure condition. 
+Note, for pendulum, the episodes trunicate at 200 time steps and has no failure condition. 
 TODO: Turns out, moving things to gpu doesn't make things quicker if you have a small enough model such that
 the transfer from gpu -> cpu is outpaced by the time it takes for your data to go through your model. 
 Making this quicker, then, is for a time when we can run multiple envs at the same time. until then, cpu it is! 
@@ -79,6 +78,7 @@ class PPO:
         self.a_lr = a_lr
         self.c_lr = c_lr
         self.max_ts = max_ts
+        self.target_kld = 0.2
         self.device = device
 
         # Optionally store any extra keyword arguments
@@ -88,19 +88,25 @@ class PPO:
         # Same backbone for shared feature identification 
         self.backbone = nn.Sequential(
             nn.Linear(ob_space, 64),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(64, 64),
-            nn.ReLU(),
+            nn.Tanh(),
         ).to(self.device)
         
         # Actor
         self.actor = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.Tanh(),
             nn.Linear(64, actions),
             nn.Tanh()
         ).to(self.device)
 
         # Critic
         self.critic = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
             nn.Linear(64, 1)
         ).to(self.device)
 
@@ -111,13 +117,18 @@ class PPO:
 
         # Get Parameters 
         actor_params = list(self.backbone.parameters()) + list(self.actor.parameters())
+        #actor_params =  list(self.actor.parameters())
         critic_params = list(self.backbone.parameters()) + list(self.critic.parameters())
+        #critic_params = list(self.critic.parameters())
 
         # Optimizers
         self.actor_optim = optim.Adam(actor_params, lr=a_lr, eps=1e-5)
         self.critic_optim = optim.Adam(critic_params, lr=c_lr, eps=1e-5)
 
-        self.cov_var = t.full(size=(self.actions,), fill_value=0.5).to(self.device)
+        #self.actor_scheduler = optim.lr_scheduler.ExponentialLR(self.actor_optim, gamma=0.9999)
+        #self.critic_scheduler = optim.lr_scheduler.ExponentialLR(self.critic_optim, gamma=0.9999)
+
+        self.cov_var = t.full(size=(self.actions,), fill_value=0.2).to(self.device)
         self.cov_mat = t.diag(self.cov_var).to(self.device)
 
         # Logger, credit: Eric Yang Yu
@@ -129,6 +140,7 @@ class PPO:
             'batch_lens': [],       # episodic lengths in batch
             'batch_rews': [],       # episodic returns in batch
             'actor_losses': [],     # losses of actor network in current iteration
+            'eps_rewards': []       # A track of the sum of rewards for all episodes.
         }
 
     def init_weights(self, m):
@@ -285,6 +297,7 @@ class PPO:
             rollout_adv = self.calculate_gaes(rollout_reward, rollout_values)
             advantages.append(rollout_adv)
             ep_rewards.append(ep_reward)
+            self.logger["eps_rewards"].append(ep_reward)
 
             # Get returns
 
@@ -334,7 +347,6 @@ class PPO:
         t_so_far = 0 # Timesteps simulated so far
         i_so_far = 0 # Iterations ran so far
         while t_so_far < total_timesteps:                                                                      
-            # Autobots, roll out (just kidding, we're collecting our batch simulations here)
             obs, actions, advantages, returns, act_log_probs, ep_reward = self.rollout(env) 
             
             # Calculate how many timesteps we collected this batch
@@ -347,12 +359,15 @@ class PPO:
             self.logger['t_so_far'] = t_so_far
             self.logger['i_so_far'] = i_so_far
 
+            # normalize returns and advantages
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-10)
+            returns = (returns - returns.mean()) / (returns.std() + 1e-10)
 
             # This is the loop where we update our network for some n epochs
-            for _ in range(self.n_updates_per_iteration):
+            for iters in range(self.n_updates_per_iteration):
+                mean_kld_track = []
                 for mb_obs, mb_actions, mb_advantages, mb_returns, mb_act_log_probs in \
-                    self.create_minibatches(obs, actions, advantages, returns, act_log_probs, batch_size=500):                                                   
+                    self.create_minibatches(obs, actions, advantages, returns, act_log_probs, batch_size=100):                                                   
                     # Calculate V_phi and pi_theta(a_t | s_t)
                     V, curr_log_probs, entropy = self.evaluate(mb_obs, mb_actions)
 
@@ -379,7 +394,18 @@ class PPO:
                     # Log actor loss
                     #print("actor loss: ", actor_loss.detach().item())
 
+                    kld = t.abs((curr_log_probs - mb_act_log_probs).mean())
+                    mean_kld_track.append(kld.item())
+
+                
                 self.logger['actor_losses'].append(actor_loss.cpu().detach())
+
+                kld = sum(mean_kld_track)/len(mean_kld_track)
+
+                if kld >= self.target_kld:
+                    print("Break KLD", kld)
+                    print("no iters, ", iters)
+                    break
 
             # Print a summary of our training so far
             self._log_summary(ep_reward, obs.shape[0])
