@@ -1,13 +1,6 @@
 <div align="center"><img src="https://raw.githubusercontent.com/mlech26l/ncps/master/docs/img/banner.png" width="800"/></div>
 
-# Neural Circuit Policies (for PyTorch and TensorFlow)
-
-[![DOI](https://zenodo.org/badge/290199641.svg)](https://zenodo.org/badge/latestdoi/290199641)
-![ci_badge](https://github.com/mlech26l/ncps/actions/workflows/python-test.yml/badge.svg) 
-![pyversion](misc/pybadge.svg)
-![PyPI version](https://img.shields.io/pypi/v/ncps)
-![Documentation Status](https://readthedocs.org/projects/ncps/badge/?version=latest)
-![downloads](https://img.shields.io/pypi/dm/ncps)
+# CUCAI Project: CFC Networks as Expressive World Models for Robot Control
 
 ## 📜 Papers
 
@@ -16,17 +9,26 @@
 
 
 This fork is intended to explore the use of specifically CFC networks as more expressive world models. Run as a UVicAI club project, lead by @tristongrayston.
-Message on Discord @triston_g or email @uvicaiclub@gmail.com if you're interested in helping with this project. 
 
-Todo list: 
+Message on Discord (@triston_g) or email uvicaiclub@gmail.com if you're interested in helping with this project. 
 
-CFC side:
+## Todo list: 
+
+### CFC side:
 
 
-PPO side:
+### PPO side:
+
 Graphical output on PPO baseline training could be better.
+
 Running multiple simulations at a time, or optimizing code such that it runs faster on GPU. 
+
 Various tuning to PPO could be better. Maybe playing around with no shared params (does it even make sense to have shared params on non-pixelated inputs?) 
+
+Implement alternative baseline for different environment (half cheetah ideally)
+
+
+
 
 
 
