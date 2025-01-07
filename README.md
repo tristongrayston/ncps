@@ -31,7 +31,6 @@ Implement alternative baseline for different environment (half cheetah ideally)
 
 
 
-
 ```bib
 @article{lechner2020neural,
   title={Neural circuit policies enabling auditable autonomy},
