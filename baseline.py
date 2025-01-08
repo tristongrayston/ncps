@@ -24,7 +24,7 @@ def train_ppo():
         max_ts=500_000,
 
         # Any custom kwargs can also be passed in here. For example:
-        timesteps_per_batch=5,
+        timesteps_per_batch=10,
         max_timesteps_per_episode=200,
         n_updates_per_iteration=3,
     )
@@ -58,15 +58,42 @@ def test_ppo(ppo_agent):
     # Once the episode is done, close the environment
     env.close()
 
-def plot_eps_rewards(agent):
+import matplotlib.pyplot as plt
+import numpy as np
+
+def plot_eps_rewards(agent, window_size=10):
+    """
+    Plots episode rewards over time and includes a moving average trend line.
+    
+    Parameters:
+    -----------
+    agent : object
+        Your agent object, which should have a logger dict containing 'eps_rewards'.
+    window_size : int
+        The size of the window over which to compute the moving average.
+    """
+
     # Extract the list of episode rewards
     rewards = agent.logger['eps_rewards']
 
     # Create a new figure
     plt.figure(figsize=(8, 6))
 
-    # Plot the rewards
-    plt.plot(rewards, marker='o', linestyle='-', color='b')
+    # Plot the raw episode rewards
+    plt.plot(rewards, marker='o', linestyle='-', color='b', label='Episode Rewards')
+
+    # Compute the rolling/moving average
+    if len(rewards) >= window_size:
+        # Cumulative sum trick for moving average
+        cumsum = np.cumsum(np.insert(rewards, 0, 0))
+        mov_avg = (cumsum[window_size:] - cumsum[:-window_size]) / float(window_size)
+
+        # Plot the moving average (shift the x-axis by window_size/2 for alignment)
+        plt.plot(range(window_size, len(rewards) + 1),
+                 mov_avg,
+                 color='red',
+                 linewidth=2,
+                 label=f'Moving Average (window={window_size})')
 
     # Add axis labels and a title
     plt.xlabel("Episode")
@@ -76,8 +103,12 @@ def plot_eps_rewards(agent):
     # (Optional) Add grid lines
     plt.grid(True)
 
+    # Add a legend
+    plt.legend()
+
     # Display the plot
     plt.show()
+
 
 
 

@@ -30,6 +30,12 @@ class PPO:
         c_lr=1e-5,               # critic learning rate
         device='cpu',            # device, e.g. 'cpu' or 'cuda'
         max_ts=1_000_000,        # max timesteps
+        target_kld = 0.002,       # actor target kld 
+
+        timesteps_per_batch=5,
+        max_timesteps_per_episode=200,
+        n_updates_per_iteration=3,
+
         **kwargs
         ):
         """
@@ -78,48 +84,56 @@ class PPO:
         self.a_lr = a_lr
         self.c_lr = c_lr
         self.max_ts = max_ts
-        self.target_kld = 0.2
+        self.target_kld = target_kld
         self.device = device
+        self.timesteps_per_batch = timesteps_per_batch
+        self.max_timesteps_per_episode = max_timesteps_per_episode
+        self.n_updates_per_iteration = n_updates_per_iteration
+        self.backbone = True # so far this does nothing, but it would be great if we changed it to do things. 
 
         # Optionally store any extra keyword arguments
         for key, value in kwargs.items():
             setattr(self, key, value)
 
         # Same backbone for shared feature identification 
-        self.backbone = nn.Sequential(
-            nn.Linear(ob_space, 64),
-            nn.Tanh(),
-            nn.Linear(64, 64),
-            nn.Tanh(),
-        ).to(self.device)
+        #self.backbone = nn.Sequential(
+        #    nn.Linear(ob_space, 64),
+        #    nn.ReLU(),
+        #    nn.Linear(64, 64),
+        #    nn.ReLU(),
+        #).to(self.device)
         
         # Actor
         self.actor = nn.Sequential(
+            nn.Linear(ob_space, 64),
+            nn.ReLU(),
             nn.Linear(64, 64),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(64, actions),
             nn.Tanh()
         ).to(self.device)
 
         # Critic
         self.critic = nn.Sequential(
+            nn.Linear(ob_space, 64),
+            nn.ReLU(),
             nn.Linear(64, 64),
-            nn.Tanh(),
-            nn.Linear(64, 64),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(64, 1)
         ).to(self.device)
 
         # init orth. weights
-        self.backbone.apply(self.init_weights)
+        #self.backbone.apply(self.init_weights)
         self.actor.apply(self.init_weights)
         self.critic.apply(self.init_weights)
 
         # Get Parameters 
-        actor_params = list(self.backbone.parameters()) + list(self.actor.parameters())
-        #actor_params =  list(self.actor.parameters())
-        critic_params = list(self.backbone.parameters()) + list(self.critic.parameters())
-        #critic_params = list(self.critic.parameters())
+        #actor_params = list(self.backbone.parameters()) + list(self.actor.parameters())
+        #critic_params = list(self.backbone.parameters()) + list(self.critic.parameters())
+
+        # if no backbone
+        actor_params =  list(self.actor.parameters())
+        critic_params = list(self.critic.parameters())
 
         # Optimizers
         self.actor_optim = optim.Adam(actor_params, lr=a_lr, eps=1e-5)
@@ -161,8 +175,8 @@ class PPO:
         """
         # This might be wrong, check on this later
         with t.no_grad():
-            feats = self.backbone(obs)
-            mean = self.actor(feats)*2
+            #feats = self.backbone(obs)
+            mean = self.actor(obs)*2
 
         dist = t.distributions.MultivariateNormal(mean, self.cov_mat)
 
@@ -174,8 +188,8 @@ class PPO:
     
     def get_vf(self, obs, rollout=True):
         with t.no_grad():
-            feats = self.backbone(obs)
-            vf = self.critic(feats)
+            #feats = self.backbone(obs)
+            vf = self.critic(obs)
 
         return vf.cpu().numpy()
     
@@ -195,14 +209,14 @@ class PPO:
                 V - the predicted values of batch_obs
                 log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
         """
-        feats = self.backbone(batch_obs)
+        #feats = self.backbone(batch_obs)
 
         # Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
-        V = self.critic(feats).squeeze()
+        V = self.critic(batch_obs).squeeze()
 
         # Calculate the log probabilities of batch actions using most recent actor network.
         # This segment of code is similar to that in get_action()
-        mean = self.actor(feats)*2
+        mean = self.actor(batch_obs)*2
         dist = t.distributions.MultivariateNormal(mean, self.cov_mat)
         log_probs = dist.log_prob(batch_acts)
         entropy = dist.entropy().mean()
@@ -257,7 +271,6 @@ class PPO:
 
         
         for i in range(self.timesteps_per_batch):
-            # We want to make sure we train on atleast this many number of timesteps per episode
             rollout_reward = []
             rollout_values = []
             done = False
@@ -367,7 +380,10 @@ class PPO:
             for iters in range(self.n_updates_per_iteration):
                 mean_kld_track = []
                 for mb_obs, mb_actions, mb_advantages, mb_returns, mb_act_log_probs in \
-                    self.create_minibatches(obs, actions, advantages, returns, act_log_probs, batch_size=100):                                                   
+                    self.create_minibatches(obs, actions, advantages, returns, act_log_probs, batch_size=500):  
+                    self.actor_optim.zero_grad()
+                    self.critic_optim.zero_grad()
+
                     # Calculate V_phi and pi_theta(a_t | s_t)
                     V, curr_log_probs, entropy = self.evaluate(mb_obs, mb_actions)
 
@@ -383,10 +399,19 @@ class PPO:
                     actor_loss = -(t.min(surr1, surr2)).mean() - self.entropy_coeff * entropy
                     critic_loss = nn.MSELoss()(V, mb_returns)
 
+                    # steady updates wanted, so if we change too much we cancel the training entirely and
+                    # run the next n rollouts.
+                    kld = t.abs((curr_log_probs - mb_act_log_probs).mean())
+                    #kld = sum(mean_kld_track)/len(mean_kld_track)
+                    #print(kld)
+                    if kld >= self.target_kld:
+                        #print("Break KLD", kld)
+                        #print("no iters, ", iters)
+                        break
+
                     # Calculate gradients and perform backward propagation for both network
-                    self.actor_optim.zero_grad()
-                    self.critic_optim.zero_grad()
-                    actor_loss.backward(retain_graph=True)
+                    
+                    actor_loss.backward()
                     critic_loss.backward()
                     self.actor_optim.step()
                     self.critic_optim.step()
@@ -394,18 +419,13 @@ class PPO:
                     # Log actor loss
                     #print("actor loss: ", actor_loss.detach().item())
 
-                    kld = t.abs((curr_log_probs - mb_act_log_probs).mean())
+                    
                     mean_kld_track.append(kld.item())
 
                 
                 self.logger['actor_losses'].append(actor_loss.cpu().detach())
 
-                kld = sum(mean_kld_track)/len(mean_kld_track)
-
-                if kld >= self.target_kld:
-                    print("Break KLD", kld)
-                    print("no iters, ", iters)
-                    break
+                
 
             # Print a summary of our training so far
             self._log_summary(ep_reward, obs.shape[0])
@@ -469,15 +489,14 @@ class PPO:
         """
             Print to stdout what we've logged so far in the most recent batch.
 
+            Logger, credit: Eric Yang Yu
+
             Parameters:
                 None
 
             Return:
                 None
         """
-        # Calculate logging values. I use a few python shortcuts to calculate each value
-        # without explaining since it's not too important to PPO; feel free to look it over,
-        # and if you have any questions you can email me (look at bottom of README)
         delta_t = self.logger['delta_t']
         self.logger['delta_t'] = time.time_ns()
         delta_t = (self.logger['delta_t'] - delta_t) / 1e9
